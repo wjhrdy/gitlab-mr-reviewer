@@ -1,35 +1,55 @@
-FROM registry.access.redhat.com/ubi9/python-39:latest
+# Multi-stage Dockerfile using Alpine (smaller and often more reliable)
+FROM python:3.12-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache \
+    build-base \
+    git \
+    curl \
+    gcc \
+    musl-dev \
+    libffi-dev
+
+# Copy project files
+COPY requirements.txt /app/requirements.txt
+COPY generate-mr-summary.py /app/generate-mr-summary.py
+COPY prompt_template.txt /app/prompt_template.txt
+
+# Install Python packages
+WORKDIR /app
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Final stage (runtime environment)
+FROM python:3.12-alpine
+
+# Install minimal runtime dependencies
+RUN apk add --no-cache curl ca-certificates
+
+# Create non-root user for security
+RUN addgroup -g 1001 -S appuser && \
+    adduser -S -D -H -u 1001 -h /app -s /sbin/nologin -G appuser appuser
+
+# Copy only the necessary files from the builder stage
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /app /app
+
+# Set working directory and ownership
+WORKDIR /app
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app
 
-# Switch to root to install system packages
-USER 0
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import sys; print('Python OK')" || exit 1
 
-# Install system dependencies
-RUN yum update -y && \
-    yum install -y git && \
-    yum clean all && \
-    rm -rf /var/cache/yum
-
-# Switch back to the default user
-USER 1001
-
-# Set working directory
-WORKDIR /app
-
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Copy the application code and prompt template
-COPY generate-mr-summary.py .
-COPY prompt_template.txt .
-
-# Create a non-root user for security
-RUN chmod +x generate-mr-summary.py
-
-# Set the default command
+# Command to run the application
 CMD ["python", "generate-mr-summary.py"]
