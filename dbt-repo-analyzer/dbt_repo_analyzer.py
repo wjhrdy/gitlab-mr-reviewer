@@ -616,6 +616,8 @@ async def handle_gitlab_webhook(
     try:
         # Get raw payload for signature verification
         payload_bytes = await request.body()
+
+        logger.debug(f"Received GitLab webhook payload of size {len(payload_bytes)} bytes")
         
         # Verify webhook signature if secret is configured
         if GITLAB_WEBHOOK_SECRET:
@@ -624,6 +626,7 @@ async def handle_gitlab_webhook(
             
             if not verify_gitlab_signature(payload_bytes, x_gitlab_token, GITLAB_WEBHOOK_SECRET):
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        logger.debug("Webhook signature verified successfully")
         
         # Parse JSON payload
         try:
@@ -631,14 +634,21 @@ async def handle_gitlab_webhook(
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON payload")
         
+
+        logger.debug(f"Parsed GitLab webhook payload: {payload.get('object_kind', 'unknown')} event")
+        
         # Only process merge request events
         if payload.get("object_kind") != "merge_request":
             return {"status": "ignored", "reason": "not a merge request event"}
         
+        logger.info(f"Processing merge request event for project {payload['project']['name']} (ID: {payload['project']['id']})")
+
         # Only process opened or updated MRs
         mr_action = payload.get("object_attributes", {}).get("action")
         if mr_action not in ["open", "update"]:
             return {"status": "ignored", "reason": f"action '{mr_action}' not relevant"}
+        
+        logger.debug(f"Merge request action: {mr_action}")
         
         project_id = payload["project"]["id"]
         mr_iid = payload["object_attributes"]["iid"]
@@ -646,10 +656,14 @@ async def handle_gitlab_webhook(
         # Get MR changes
         gitlab_api = GitLabAPI(GITLAB_TOKEN, GITLAB_BASE_URL)
         changes = await gitlab_api.get_mr_changes(project_id, mr_iid)
+
+        logger.debug(f"Retrieved {len(changes)} changes for MR {mr_iid} in project {project_id}")
         
         # Analyze changes with Gemini
         analyzer = GeminiAnalyzer()
         promotion = await analyzer.analyze_mr_for_promotion(changes)
+
+        logger.debug(f"Promotion analysis result: {promotion}")
         
         if not promotion:
             return {"status": "ignored", "reason": "no data product promotion detected"}
