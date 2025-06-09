@@ -533,7 +533,6 @@ async def process_promotion(promotion: PromotionInfo, gitlab_api: GitLabAPI):
 **Product**: {promotion.product_name}  
 **Type**: {promotion.product_type}-aligned  
 **Environment**: {promotion.environment}  
-**Status**: 🔄 Processing...
 
 Cloning dbt repository and running analysis...
 """
@@ -553,7 +552,6 @@ Cloning dbt repository and running analysis...
 **Product**: {promotion.product_name}  
 **Type**: {promotion.product_type}-aligned  
 **Environment**: {promotion.environment}  
-**Status**: ❌ Failed
 
 **Error**: {message}
 """
@@ -576,7 +574,6 @@ Cloning dbt repository and running analysis...
 **Product**: {promotion.product_name}  
 **Type**: {promotion.product_type}-aligned  
 **Environment**: {promotion.environment}  
-**Status**: ✅ Complete
 
 ### dbt Project Analysis
 
