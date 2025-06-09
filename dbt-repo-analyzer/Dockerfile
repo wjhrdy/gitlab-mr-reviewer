@@ -45,13 +45,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create non-root user for OpenShift security (Alpine style)
-RUN addgroup -g 1001 appuser && \
-    adduser -D -u 1001 -G appuser appuser && \
-    chown -R appuser:appuser /app
+# Make /app and /tmp writable for any user (OpenShift compatibility)
+RUN chmod -R g+rwX /app && \
+    chmod -R g+rwX /tmp
 
-# Switch to non-root user
-USER 1001
+# Don't create specific user - let OpenShift assign UID
+# OpenShift will automatically assign a UID in the allowed range
 
 # Expose port
 EXPOSE 8000
