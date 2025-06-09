@@ -1,55 +1,41 @@
-# Multi-stage Dockerfile using Alpine (smaller and often more reliable)
-FROM python:3.12-alpine AS builder
+ Dockerfile - Alpine-based, OpenShift-compatible
+FROM python:3.11-alpine
 
-# Install build dependencies
+WORKDIR /app
+
+# Install system dependencies
 RUN apk add --no-cache \
-    build-base \
     git \
     curl \
     gcc \
     musl-dev \
-    libffi-dev
+    libffi-dev \
+    openssl-dev \
+    && rm -rf /var/cache/apk/*
 
-# Copy project files
-COPY requirements.txt /app/requirements.txt
-COPY generate-mr-summary.py /app/generate-mr-summary.py
-COPY prompt_template.txt /app/prompt_template.txt
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Python packages
-WORKDIR /app
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# Copy the application code
+COPY webhook_service.py .
+COPY prompt_template.txt .
 
-# Final stage (runtime environment)
-FROM python:3.12-alpine
+# OpenShift runs containers with arbitrary UIDs in the root group
+# Set proper permissions for the root group
+RUN chgrp -R 0 /app && \
+    chmod -R g+rwX /app && \
+    chown -R 1001:0 /app
 
-# Install minimal runtime dependencies
-RUN apk add --no-cache curl ca-certificates
+# Create a non-root user (OpenShift will override the UID but respect the group)
+USER 1001
 
-# Create non-root user for security
-RUN addgroup -g 1001 -S appuser && \
-    adduser -S -D -H -u 1001 -h /app -s /sbin/nologin -G appuser appuser
-
-# Copy only the necessary files from the builder stage
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
-COPY --from=builder /app /app
-
-# Set working directory and ownership
-WORKDIR /app
-RUN chown -R appuser:appuser /app
-
-# Switch to non-root user
-USER appuser
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONPATH=/app
+# Expose port
+EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sys; print('Python OK')" || exit 1
+    CMD curl -f http://localhost:8080/health || exit 1
 
-# Command to run the application
-CMD ["python", "generate-mr-summary.py"]
+# Run the webhook service
+CMD ["python", "webhook_service.py"]
