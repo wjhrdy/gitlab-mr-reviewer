@@ -641,8 +641,7 @@ async def handle_gitlab_webhook(
         if payload.get("object_kind") != "merge_request":
             return {"status": "ignored", "reason": "not a merge request event"}
         
-        logger.info(f"Processing merge request event for project {payload['project']['name']} (ID: {payload['project']['id']})")
-
+        logger.debug("Processing merge request event")  
         # Only process opened or updated MRs
         mr_action = payload.get("object_attributes", {}).get("action")
         if mr_action not in ["open", "update"]:
