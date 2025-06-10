@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY webhook_service.py .
-COPY prompt_template.txt .
+#COPY prompt_template.txt .
 
 # OpenShift runs containers with arbitrary UIDs in the root group
 # Set proper permissions for the root group
@@ -38,4 +38,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Run the webhook service
-CMD ["python", "webhook_service.py"]
+CMD ["python", "mr_webhook_service.py"]

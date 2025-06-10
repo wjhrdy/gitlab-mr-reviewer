@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Flask webhook service with native GitLab MR summarizer implementation.
+Updated to use the new Google Gen AI SDK.
 No subprocess calls - everything runs in the same process.
 """
 
@@ -15,7 +16,8 @@ from typing import Dict, List, Optional
 from datetime import datetime
 from flask import Flask, request, jsonify, abort
 import logging
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import urllib3
 
 app = Flask(__name__)
@@ -23,6 +25,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', '')
+MODEL_NAME = os.getenv('MODEL_NAME', 'models/gemini-2.5-flash-preview-05-20')
 
 class GitLabMRSummarizer:
     """GitLab MR Summarizer integrated into the webhook service."""
@@ -61,9 +64,8 @@ class GitLabMRSummarizer:
             if not self.gemini_api_key: missing.append('GEMINI_API_KEY')
             raise ValueError(f"Missing required parameters: {', '.join(missing)}")
         
-        # Configure Gemini
-        genai.configure(api_key=self.gemini_api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        # Configure new Gemini SDK
+        self.client = genai.Client(api_key=self.gemini_api_key)
         
         # GitLab API headers
         self.headers = {
@@ -197,7 +199,7 @@ Focus on what's most important for code reviewers to understand."""
             return {}
     
     def generate_summary_with_gemini(self, diff_content: str, mr_details: Dict) -> str:
-        """Generate a summary using Gemini API."""
+        """Generate a summary using the new Gemini API."""
         
         # Truncate diff if it's too long
         max_diff_length = int(os.getenv('MAX_DIFF_LENGTH', '50000'))
@@ -237,7 +239,11 @@ Focus on what's most important for code reviewers to understand."""
             )
         
         try:
-            response = self.model.generate_content(prompt)
+            # Use the new SDK's generate_content method
+            response = self.client.models.generate_content(
+                model=MODEL_NAME,  # Updated to use Gemini 2.0
+                contents=prompt
+            )
             return response.text
         except Exception as e:
             return f"❌ Error generating summary with Gemini: {str(e)}"
@@ -275,7 +281,7 @@ Focus on what's most important for code reviewers to understand."""
 
 - **Commit**: {commit_sha}
 - **Generated**: {self.get_current_timestamp()}
-- **AI Model**: Gemini 1.5 Flash
+- **AI Model**: {MODEL_NAME}
 
 *This summary is automatically updated when new commits are pushed to the MR.*
 </details>
