@@ -16,11 +16,13 @@ from pathlib import Path
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # Configure logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -39,6 +41,7 @@ GITLAB_TOKEN = os.getenv("GITLAB_API_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GITLAB_WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 GITLAB_BASE_URL = "https://gitlab.cee.redhat.com"
+REPO_CLONE_COOLDOWN_MINUTES = int(os.getenv("REPO_CLONE_COOLDOWN_MINUTES", "1"))
 
 if not GITLAB_TOKEN or not GEMINI_API_KEY:
     raise ValueError("GITLAB_TOKEN and GEMINI_API_KEY environment variables are required")
@@ -46,8 +49,13 @@ if not GITLAB_TOKEN or not GEMINI_API_KEY:
 if not GITLAB_WEBHOOK_SECRET:
     logger.warning("GITLAB_WEBHOOK_SECRET not set - webhook validation disabled (not recommended for production)")
 
-# Configure Gemini AI
-genai.configure(api_key=GEMINI_API_KEY)
+logger.info(f"Repository clone cooldown set to {REPO_CLONE_COOLDOWN_MINUTES} minutes")
+
+# Configure Gemini AI Client
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Repository clone cooldown tracking
+repo_clone_cache = {}
 
 app = FastAPI(title="Data Product Promotion Handler")
 
@@ -156,8 +164,8 @@ class GitLabAPI:
 class GeminiAnalyzer:
     """Gemini AI analyzer for MR changes and dbt manifests"""
     
-    def __init__(self):
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+    def __init__(self, client: genai.Client):
+        self.client = client
     
     async def analyze_mr_for_promotion(self, changes: List[Dict]) -> Optional[PromotionInfo]:
         """Analyze MR changes to detect data product promotions"""
@@ -203,26 +211,18 @@ class GeminiAnalyzer:
         
         try:
             logger.debug("Sending analysis request to Gemini API")
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model='gemini-2.5-flash-preview-05-20',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type='application/json',
+                    temperature=0.1
+                )
+            )
             logger.debug(f"Gemini API response: {response.text[:200]}...")
             
-            # Extract JSON from markdown code blocks if present
-            response_text = response.text.strip()
-            if response_text.startswith("```json"):
-                # Remove ```json and ``` markers
-                response_text = response_text[7:]  # Remove ```json
-                if response_text.endswith("```"):
-                    response_text = response_text[:-3]  # Remove ```
-                response_text = response_text.strip()
-            elif response_text.startswith("```"):
-                # Handle generic ``` blocks
-                lines = response_text.split('\n')
-                if len(lines) > 2:
-                    response_text = '\n'.join(lines[1:-1])  # Remove first and last lines
-                response_text = response_text.strip()
-            
-            logger.debug(f"Cleaned response text: {response_text}")
-            result = json.loads(response_text)
+            result = json.loads(response.text.strip())
             logger.debug(f"Parsed Gemini result: {result}")
             
             if result.get("is_promotion") and result.get("confidence") in ["high", "medium"]:
@@ -318,33 +318,173 @@ class GeminiAnalyzer:
             """
             
             logger.debug("Sending manifest analysis request to Gemini API")
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model='models/gemini-2.5-flash-preview-05-20',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=6000
+                )
+            )
             
-            # Clean up any markdown code blocks that might be returned
+            # Check if response and response.text are valid
+            if not response:
+                logger.error("Gemini API returned no response for manifest analysis")
+                return "❌ Error: No response from Gemini API for manifest analysis"
+            
+            if not hasattr(response, 'text') or response.text is None:
+                logger.error("Gemini API response has no text attribute or text is None")
+                return "❌ Error: Invalid response format from Gemini API for manifest analysis"
+            
+            # The response should already be clean text without code blocks
             response_text = response.text.strip()
-            if response_text.startswith("```") and response_text.endswith("```"):
-                lines = response_text.split('\n')
-                if len(lines) > 2:
-                    response_text = '\n'.join(lines[1:-1])  # Remove first and last lines
-                response_text = response_text.strip()
+            
+            # Additional check for empty response
+            if not response_text:
+                logger.warning("Gemini API returned empty text for manifest analysis")
+                return "⚠️ Manifest analysis completed but no content was generated"
             
             logger.debug(f"Manifest analysis completed, response length: {len(response_text)}")
             return response_text
             
+        except FileNotFoundError:
+            logger.error(f"Manifest file not found: {manifest_path}")
+            return f"❌ Error: Manifest file not found at {manifest_path}"
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing manifest JSON: {e}")
+            return f"❌ Error parsing manifest JSON: {str(e)}"
         except Exception as e:
             logger.error(f"Error analyzing manifest with Gemini: {e}")
+            logger.debug(f"Full error details: {e}", exc_info=True)
             return f"❌ Error analyzing dbt manifest: {str(e)}"
+    
+    async def analyze_gitlab_ci(self, ci_file_path: str) -> str:
+        """Analyze .gitlab-ci.yml and generate pipeline summary"""
+        
+        try:
+            with open(ci_file_path, 'r') as f:
+                import yaml
+                ci_config = yaml.safe_load(f)
+            
+            # Validate that we successfully loaded the YAML
+            if ci_config is None:
+                logger.warning(f"GitLab CI file {ci_file_path} is empty or invalid")
+                return "⚠️ GitLab CI file appears to be empty or invalid YAML"
+            
+            logger.debug(f"Successfully loaded GitLab CI config with {len(ci_config)} top-level keys")
+            
+            prompt = f"""
+
+Analyze this GitLab CI/CD pipeline configuration and provide a focused markdown summary with two distinct sections:
+
+1.  **Environment Overview**
+    Create a table summarizing the testing and deployment strategies for the 'dev' and 'pre-prod' environments based on the pipeline configuration.
+
+    | Environment | Tests (e.g., dbt test, data quality, unit) | Deployments (Automated/Manual) |
+    |-------------|--------------------------------------------|--------------------------------|
+    | dev         |                                            |                                |
+    | pre-prod    |                                            |                                |
+
+    Populate the 'Tests' column with the command or job names used for testing in each environment, such as `dbt test`. If no tests are defined, indicate that clearly.
+    Populate the 'Deployments' column indicating whether deployments to that environment are automated or manual, and briefly describe the deployment action.
+
+2.  **Metadata Publishing**
+    Check if metadata is being published to Atlan or any other data catalog within this pipeline.
+    If metadata publishing is not present, indicate that as well. Summarize the findings in a 1 sentence.
+
+    GITLAB CI CONFIG:
+    {json.dumps(ci_config, indent=2, default=str)}
+            """
+            
+            logger.debug("Sending GitLab CI analysis request to Gemini API")
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model='models/gemini-2.5-flash-preview-05-20',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=6000
+                )
+            )
+            
+            # Check if response and response.text are valid
+            if not response:
+                logger.error("Gemini API returned no response for GitLab CI analysis")
+                return "❌ Error: No response from Gemini API for GitLab CI analysis"
+            
+            if not hasattr(response, 'text') or response.text is None:
+                logger.error("Gemini API response has no text attribute or text is None")
+                return "❌ Error: Invalid response format from Gemini API for GitLab CI analysis"
+            
+            response_text = response.text.strip()
+            logger.debug(f"GitLab CI analysis completed, response length: {len(response_text)}")
+            
+            # Additional check for empty response
+            if not response_text:
+                logger.warning("Gemini API returned empty text for GitLab CI analysis")
+                return "⚠️ GitLab CI analysis completed but no content was generated"
+            
+            return response_text
+            
+        except FileNotFoundError:
+            logger.error(f"GitLab CI file not found: {ci_file_path}")
+            return f"❌ Error: GitLab CI file not found at {ci_file_path}"
+        except yaml.YAMLError as e:
+            logger.error(f"Error parsing GitLab CI YAML: {e}")
+            return f"❌ Error parsing GitLab CI YAML: {str(e)}"
+        except json.JSONEncoder as e:
+            logger.error(f"Error serializing GitLab CI config to JSON: {e}")
+            return f"❌ Error processing GitLab CI configuration: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error analyzing GitLab CI with Gemini: {e}")
+            logger.debug(f"Full error details: {e}", exc_info=True)
+            return f"❌ Error analyzing GitLab CI configuration: {str(e)}"
 
 
 class DBTRunner:
     """Handle dbt operations"""
     
     @staticmethod
-    async def clone_and_parse(repo_url: str, gitlab_token: str = None) -> Tuple[bool, str, Optional[str]]:
-        """Clone repo and run dbt parse, return (success, message, manifest_path)"""
+    def is_repo_in_cooldown(repo_url: str) -> bool:
+        """Check if repository is in cooldown period"""
+        if repo_url not in repo_clone_cache:
+            return False
+        
+        last_clone_time = repo_clone_cache[repo_url]
+        cooldown_period = timedelta(minutes=REPO_CLONE_COOLDOWN_MINUTES)
+        
+        if datetime.now() - last_clone_time < cooldown_period:
+            remaining_time = cooldown_period - (datetime.now() - last_clone_time)
+            logger.info(f"Repository {repo_url} is in cooldown for {remaining_time.total_seconds():.0f} more seconds")
+            return True
+        
+        return False
+    
+    @staticmethod
+    def update_repo_clone_time(repo_url: str):
+        """Update the last clone time for a repository"""
+        repo_clone_cache[repo_url] = datetime.now()
+        logger.debug(f"Updated clone time for {repo_url}")
+    
+    @staticmethod
+    async def clone_and_parse(repo_url: str, gitlab_token: str = None) -> Tuple[bool, str, Optional[str], Optional[str]]:
+        """Clone repo and run dbt parse, return (success, message, manifest_path, ci_file_path)"""
+        
+        # Check if repository is in cooldown period
+        if DBTRunner.is_repo_in_cooldown(repo_url):
+            cooldown_remaining = REPO_CLONE_COOLDOWN_MINUTES - (
+                (datetime.now() - repo_clone_cache[repo_url]).total_seconds() / 60
+            )
+            cooldown_message = f"Repository clone skipped due to cooldown. Please wait {cooldown_remaining:.1f} more minutes before retrying."
+            logger.warning(f"Clone attempt blocked by cooldown: {repo_url}")
+            return False, cooldown_message, None, None
         
         temp_dir = None
         try:
+            # Update clone time at the start of the process
+            DBTRunner.update_repo_clone_time(repo_url)
+            
             # Create temporary directory in /tmp (mounted as emptyDir in OpenShift)
             temp_dir = tempfile.mkdtemp(prefix="dbt_", dir="/tmp")
             logger.info(f"Created temporary directory: {temp_dir}")
@@ -362,9 +502,21 @@ class DBTRunner:
             
             if result.returncode != 0:
                 logger.error(f"Git clone failed: {result.stderr}")
-                return False, f"Git clone failed: {result.stderr}", None
+                return False, f"Git clone failed: {result.stderr}", None, None
             
             logger.info(f"Successfully cloned repository to {temp_dir}")
+            
+            # Check for .gitlab-ci.yml file
+            ci_file_path = None
+            for ci_filename in [".gitlab-ci.yml", ".gitlab-ci.yaml"]:
+                potential_path = os.path.join(temp_dir, ci_filename)
+                if os.path.exists(potential_path):
+                    ci_file_path = potential_path
+                    logger.info(f"Found GitLab CI file: {ci_filename}")
+                    break
+            
+            if not ci_file_path:
+                logger.debug("No .gitlab-ci.yml file found in repository")
             
             # Set up dbt environment with comprehensive SSL bypass
             env = os.environ.copy()
@@ -498,7 +650,7 @@ local:
             if result.returncode != 0:
                 logger.error(f"dbt parse failed: {result.stderr}")
                 logger.debug(f"dbt parse stdout: {result.stdout}")
-                return False, f"dbt parse failed: {result.stderr}", None
+                return False, f"dbt parse failed: {result.stderr}", None, None
             
             logger.info("dbt parse completed successfully")
             
@@ -506,17 +658,17 @@ local:
             manifest_path = os.path.join(temp_dir, "target", "manifest.json")
             if not os.path.exists(manifest_path):
                 logger.error(f"manifest.json not found at {manifest_path}")
-                return False, "manifest.json not found after dbt parse", None
+                return False, "manifest.json not found after dbt parse", None, None
             
             logger.info(f"Found manifest.json at {manifest_path}")
-            return True, "dbt parse successful", manifest_path
+            return True, "dbt parse successful", manifest_path, ci_file_path
             
         except subprocess.TimeoutExpired:
             logger.error("dbt operations timed out")
-            return False, "dbt operations timed out", None
+            return False, "dbt operations timed out", None, None
         except Exception as e:
             logger.error(f"Error in dbt operations: {str(e)}")
-            return False, f"Error in dbt operations: {str(e)}", None
+            return False, f"Error in dbt operations: {str(e)}", None, None
         finally:
             # Cleanup will happen after manifest analysis
             pass
@@ -542,7 +694,7 @@ Cloning dbt repository and running analysis...
     )
     
     # Clone repo and run dbt parse (GitLab token only used for API calls)
-    success, message, manifest_path = await DBTRunner.clone_and_parse(
+    success, message, manifest_path, ci_file_path = await DBTRunner.clone_and_parse(
         promotion.dbt_repo_url
     )
     
@@ -561,8 +713,24 @@ Cloning dbt repository and running analysis...
         return
     
     # Analyze manifest with Gemini
-    analyzer = GeminiAnalyzer()
+    analyzer = GeminiAnalyzer(genai_client)
     manifest_summary = await analyzer.analyze_dbt_manifest(manifest_path)
+    
+    # Analyze GitLab CI if present
+    ci_summary = ""
+    if ci_file_path:
+        ci_summary = await analyzer.analyze_gitlab_ci(ci_file_path)
+        ci_section = f"""
+### GitLab CI/CD Pipeline Analysis
+
+{ci_summary}
+"""
+    else:
+        ci_section = """
+### GitLab CI/CD Pipeline Analysis
+
+⚠️ No `.gitlab-ci.yml` file found in the repository
+"""
     
     # Clean up temporary directory
     temp_dir = os.path.dirname(os.path.dirname(manifest_path))
@@ -579,6 +747,8 @@ Cloning dbt repository and running analysis...
 
 {manifest_summary}
 
+{ci_section}
+
 ---
 *Analysis completed by Data Product Promotion Bot*
 """
@@ -588,18 +758,18 @@ Cloning dbt repository and running analysis...
     )
 
 
-def verify_gitlab_signature(payload: bytes, signature: str, secret: str) -> bool:
-    """Verify GitLab webhook signature"""
-    if not secret:
-        return True  # Skip validation if no secret configured
+def verify_gitlab_signature(payload_body, signature_header):
+    """Verify GitLab webhook signature."""
+    if not GITLAB_WEBHOOK_SECRET:
+        logger.warning("No webhook secret configured - skipping signature verification")
+        return True
     
-    expected_signature = hmac.new(
-        secret.encode('utf-8'),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
+    if not signature_header:
+        logger.error("No X-Gitlab-Token header found")
+        return False
     
-    return hmac.compare_digest(signature, expected_signature)
+    # GitLab sends the token directly, not as HMAC
+    return hmac.compare_digest(signature_header, GITLAB_WEBHOOK_SECRET)
 
 
 @app.post("/webhook/gitlab")
@@ -621,7 +791,7 @@ async def handle_gitlab_webhook(
             if not x_gitlab_token:
                 raise HTTPException(status_code=401, detail="Missing X-Gitlab-Token header")
             
-            if not verify_gitlab_signature(payload_bytes, x_gitlab_token, GITLAB_WEBHOOK_SECRET):
+            if not verify_gitlab_signature(payload_bytes, GITLAB_WEBHOOK_SECRET):
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
         logger.debug("Webhook signature verified successfully")
         
@@ -656,7 +826,7 @@ async def handle_gitlab_webhook(
         logger.debug(f"Retrieved {len(changes)} changes for MR {mr_iid} in project {project_id}")
         
         # Analyze changes with Gemini
-        analyzer = GeminiAnalyzer()
+        analyzer = GeminiAnalyzer(genai_client)
         promotion = await analyzer.analyze_mr_for_promotion(changes)
 
         logger.debug(f"Promotion analysis result: {promotion}")
