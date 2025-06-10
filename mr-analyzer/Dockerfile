@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
-COPY webhook_service.py .
+COPY mr_webhook_service.py .
 #COPY prompt_template.txt .
 
 # OpenShift runs containers with arbitrary UIDs in the root group
