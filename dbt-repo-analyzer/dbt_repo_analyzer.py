@@ -307,11 +307,14 @@ class GeminiAnalyzer:
             - Total tests: {test_results["total"]}
 
             Create a concise markdown summary with these sections only:
-            1. **Test Coverage** - Total number of tests and overall assessment
-            2. **Schemas & Models** - List each schema with model count
+            1. **Test Coverage** - Total number of tests and overall assessment. 
+                                    Only take into account tests for intermediate and marts schema.
+                                    Do not add any comments about tests, only state the numbers.
+            2. **Schemas & Models** - List each schema with model count. Skip dbtlogs schema.
             3. **Marts Documentation** - For each model in marts schema, show:
                - Model name and description (if any)
                - Column documentation status (how many columns have descriptions)
+            
 
             Keep it brief and actionable. Focus on data quality and documentation gaps.
             Do NOT wrap the response in code blocks.
